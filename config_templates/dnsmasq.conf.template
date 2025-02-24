@@ -1,0 +1,6 @@
+interface={{AP_INTERFACE}}
+dhcp-range={{DHCP_RANGE_START}},{{DHCP_RANGE_END}},{{NETMASK}},24h
+bind-interfaces
+server=8.8.8.8
+log-queries
+log-dhcp
